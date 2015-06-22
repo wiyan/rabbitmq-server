@@ -215,7 +215,6 @@ start_connection(Parent, HelperSup, Deb, Sock, SockTransform) ->
                                     rabbit_net:fast_close(Sock),
                                     exit(normal)
            end,
-    log(info, "accepting AMQP connection ~p (~s)~n", [self(), Name]),
     ClientSock = socket_op(Sock, SockTransform),
     erlang:send_after(?HANDSHAKE_TIMEOUT * 1000, self(), handshake_timeout),
     {PeerHost, PeerPort, Host, Port} =
@@ -259,8 +258,9 @@ start_connection(Parent, HelperSup, Deb, Sock, SockTransform) ->
         log(info, "closing AMQP connection ~p (~s)~n", [self(), Name])
     catch
         Ex -> log(case Ex of
-                      connection_closed_abruptly -> warning;
-                      _                          -> error
+                      connection_closed_with_no_data_received -> debug;
+                      connection_closed_abruptly              -> warning;
+                      _                                       -> error
                   end, "closing AMQP connection ~p (~s):~n~p~n",
                   [self(), Name, Ex])
     after
@@ -312,8 +312,28 @@ binlist_split(Len, L, [Acc0|Acc]) when Len < 0 ->
 binlist_split(Len, [H|T], Acc) ->
     binlist_split(Len - size(H), T, [H|Acc]).
 
-mainloop(Deb, Buf, BufLen, State = #v1{sock = Sock}) ->
-    case rabbit_net:recv(Sock) of
+mainloop(Deb, Buf, BufLen, State = #v1{sock = Sock,
+                                       connection_state = CS,
+                                       connection = #connection{
+                                         name = ConnName}}) ->
+    Recv = rabbit_net:recv(Sock),
+    case CS of
+        pre_init when Buf =:= [] ->
+            %% We only new incoming connections only when either the
+            %% first byte was received or there was an error (eg. a
+            %% timeout).
+            %%
+            %% The goal is to not log TCP healthchecks (a connection
+            %% with no data received) unless specified otherwise.
+            log(case Recv of
+                  closed -> debug;
+                  _      -> info
+                end, "accepting AMQP connection ~p (~s)~n",
+                [self(), ConnName]);
+        _ ->
+            ok
+    end,
+    case Recv of
         {data, Data} ->
             recvloop(Deb, [Data | Buf], BufLen + size(Data),
                      State#v1{pending_recv = false});
@@ -333,10 +353,18 @@ mainloop(Deb, Buf, BufLen, State = #v1{sock = Sock}) ->
             end
     end.
 
-stop(closed, State) -> maybe_emit_stats(State),
-                       throw(connection_closed_abruptly);
-stop(Reason, State) -> maybe_emit_stats(State),
-                       throw({inet_error, Reason}).
+stop(closed, #v1{connection_state = pre_init} = State) ->
+    %% The connection was closed before any packet was received. It's
+    %% probably a load-balancer healthcheck: don't consider this a
+    %% failure.
+    maybe_emit_stats(State),
+    throw(connection_closed_with_no_data_received);
+stop(closed, State) ->
+    maybe_emit_stats(State),
+    throw(connection_closed_abruptly);
+stop(Reason, State) ->
+    maybe_emit_stats(State),
+    throw({inet_error, Reason}).
 
 handle_other({conserve_resources, Source, Conserve},
              State = #v1{throttle = Throttle = #throttle{alarmed_by = CR}}) ->

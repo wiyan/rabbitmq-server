@@ -23,7 +23,8 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
--export([log/3, log/4, info/1, info/2, warning/1, warning/2, error/1, error/2]).
+-export([log/3, log/4, debug/1, debug/2, info/1, info/2, warning/1,
+         warning/2, error/1, error/2]).
 
 -define(SERVER, ?MODULE).
 
@@ -34,13 +35,15 @@
 -export_type([level/0]).
 
 -type(category() :: atom()).
--type(level() :: 'info' | 'warning' | 'error').
+-type(level() :: 'debug' | 'info' | 'warning' | 'error').
 
 -spec(start_link/0 :: () -> rabbit_types:ok_pid_or_error()).
 
 -spec(log/3 :: (category(), level(), string()) -> 'ok').
 -spec(log/4 :: (category(), level(), string(), [any()]) -> 'ok').
 
+-spec(debug/1   :: (string()) -> 'ok').
+-spec(debug/2   :: (string(), [any()]) -> 'ok').
 -spec(info/1    :: (string()) -> 'ok').
 -spec(info/2    :: (string(), [any()]) -> 'ok').
 -spec(warning/1 :: (string()) -> 'ok').
@@ -59,6 +62,8 @@ log(Category, Level, Fmt) -> log(Category, Level, Fmt, []).
 log(Category, Level, Fmt, Args) when is_list(Args) ->
     gen_server:cast(?SERVER, {log, Category, Level, Fmt, Args}).
 
+debug(Fmt)         -> log(default, debug,    Fmt).
+debug(Fmt, Args)   -> log(default, debug,    Fmt, Args).
 info(Fmt)          -> log(default, info,    Fmt).
 info(Fmt, Args)    -> log(default, info,    Fmt, Args).
 warning(Fmt)       -> log(default, warning, Fmt).
@@ -84,6 +89,7 @@ handle_cast({log, Category, Level, Fmt, Args}, CatLevels) ->
     case level(Level) =< CatLevel of
         false -> ok;
         true  -> (case Level of
+                      debug   -> fun error_logger:info_msg/2;
                       info    -> fun error_logger:info_msg/2;
                       warning -> fun error_logger:warning_msg/2;
                       error   -> fun error_logger:error_msg/2
@@ -104,6 +110,7 @@ code_change(_OldVsn, State, _Extra) ->
 
 %%--------------------------------------------------------------------
 
+level(debug)   -> 4;
 level(info)    -> 3;
 level(warning) -> 2;
 level(error)   -> 1;
