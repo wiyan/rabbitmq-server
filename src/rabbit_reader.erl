@@ -192,7 +192,17 @@ socket_error(Reason) when is_atom(Reason) ->
     log(error, "error on AMQP connection ~p: ~s~n",
         [self(), rabbit_misc:format_inet_error(Reason)]);
 socket_error(Reason) ->
-    log(error, "error on AMQP connection ~p:~n~p~n", [self(), Reason]).
+    Level =
+        case Reason of
+            {ssl_upgrade_error, closed} ->
+                %% The socket was closed while upgrading to SSL.
+                %% This is presumably a TCP healthcheck, so don't log
+                %% it unless specified otherwise.
+                debug;
+            _ ->
+                error
+        end,
+    log(Level, "error on AMQP connection ~p:~n~p~n", [self(), Reason]).
 
 inet_op(F) -> rabbit_misc:throw_on_error(inet_error, F).
 
