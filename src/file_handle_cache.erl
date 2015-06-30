@@ -148,7 +148,7 @@
          copy/3, set_maximum_since_use/1, delete/1, clear/1]).
 -export([obtain/0, obtain/1, release/0, release/1, transfer/1, transfer/2,
          set_limit/1, get_limit/0, info_keys/0, with_handle/1, with_handle/2,
-         info/0, info/1, clear_read_cache/0]).
+         info/0, info/1]).
 -export([ulimit/0]).
 
 -export([start_link/0, start_link/2, init/1, handle_call/3, handle_cast/2,
@@ -164,8 +164,6 @@
 -define(CLIENT_ETS_TABLE, file_handle_cache_client).
 -define(ELDERS_ETS_TABLE, file_handle_cache_elders).
 
--include("rabbit.hrl"). % For #amqqueue record definition.
-
 %%----------------------------------------------------------------------------
 
 -record(file,
@@ -180,12 +178,6 @@
           write_buffer_size,
           write_buffer_size_limit,
           write_buffer,
-          read_buffer,
-          read_buffer_pos,
-          read_buffer_rem,        %% Num of bytes from pos to end
-          read_buffer_size,       %% Next size of read buffer to use
-          read_buffer_size_limit, %% Max size of read buffer to use
-          read_buffer_usage,      %% Bytes we have read from it, for tuning
           at_eof,
           path,
           mode,
@@ -343,52 +335,12 @@ read(Ref, Count) ->
       [Ref], keep,
       fun ([#handle { is_read = false }]) ->
               {error, not_open_for_reading};
-          ([Handle = #handle{read_buffer       = Buf,
-                             read_buffer_pos   = BufPos,
-                             read_buffer_rem   = BufRem,
-                             read_buffer_usage = BufUsg,
-                             offset            = Offset}])
-            when BufRem >= Count ->
-              <<_:BufPos/binary, Res:Count/binary, _/binary>> = Buf,
-              {{ok, Res}, [Handle#handle{offset            = Offset + Count,
-                                         read_buffer_pos   = BufPos + Count,
-                                         read_buffer_rem   = BufRem - Count,
-                                         read_buffer_usage = BufUsg + Count }]};
-          ([Handle0]) ->
-              maybe_reduce_read_cache([Ref]),
-              Handle = #handle{read_buffer      = Buf,
-                               read_buffer_pos  = BufPos,
-                               read_buffer_rem  = BufRem,
-                               read_buffer_size = BufSz,
-                               hdl              = Hdl,
-                               offset           = Offset}
-                  = tune_read_buffer_limit(Handle0, Count),
-              WantedCount = Count - BufRem,
-              case prim_file_read(Hdl, lists:max([BufSz, WantedCount])) of
-                  {ok, Data} ->
-                      <<_:BufPos/binary, BufTl/binary>> = Buf,
-                      ReadCount = size(Data),
-                      case ReadCount < WantedCount of
-                          true ->
-                              OffSet1 = Offset + BufRem + ReadCount,
-                              {{ok, <<BufTl/binary, Data/binary>>},
-                               [reset_read_buffer(
-                                  Handle#handle{offset = OffSet1})]};
-                          false ->
-                              <<Hd:WantedCount/binary, _/binary>> = Data,
-                              OffSet1 = Offset + BufRem + WantedCount,
-                              BufRem1 = ReadCount - WantedCount,
-                              {{ok, <<BufTl/binary, Hd/binary>>},
-                               [Handle#handle{offset            = OffSet1,
-                                              read_buffer       = Data,
-                                              read_buffer_pos   = WantedCount,
-                                              read_buffer_rem   = BufRem1,
-                                              read_buffer_usage = WantedCount}]}
-                      end;
-                  eof ->
-                      {eof, [Handle #handle { at_eof = true }]};
-                  Error ->
-                      {Error, [reset_read_buffer(Handle)]}
+          ([#handle{hdl = Hdl, offset = Offset} = Handle]) ->
+              case prim_file_read(Hdl, Count) of
+                  {ok, Data} -> {{ok, Data},
+                                 [Handle#handle{offset = Offset+size(Data)}]};
+                  eof        -> {eof, [Handle #handle { at_eof = true }]};
+                  Error      -> {Error, Handle}
               end
       end).
 
@@ -583,42 +535,6 @@ info_keys() -> ?INFO_KEYS.
 info() -> info(?INFO_KEYS).
 info(Items) -> gen_server2:call(?SERVER, {info, Items}, infinity).
 
-clear_read_cache() ->
-    gen_server2:cast(?SERVER, clear_read_cache),
-    clear_vhost_read_cache(rabbit_vhost:list()).
-
-clear_vhost_read_cache([]) ->
-    ok;
-clear_vhost_read_cache([VHost | Rest]) ->
-    clear_queue_read_cache(rabbit_amqqueue:list(VHost)),
-    clear_vhost_read_cache(Rest).
-
-clear_queue_read_cache([]) ->
-    ok;
-clear_queue_read_cache([#amqqueue{pid = MPid, slave_pids = SPids} | Rest]) ->
-    %% Limit the action to the current node.
-    Pids = [P || P <- [MPid | SPids], node(P) =:= node()],
-    %% This function is executed in the context of the backing queue
-    %% process because the read buffer is stored in the process
-    %% dictionary.
-    Fun = fun(_, State) ->
-                  clear_process_read_cache(),
-                  State
-          end,
-    [rabbit_amqqueue:run_backing_queue(Pid, rabbit_variable_queue, Fun)
-     || Pid <- Pids],
-    clear_queue_read_cache(Rest).
-
-clear_process_read_cache() ->
-    [
-     begin
-         Handle1 = reset_read_buffer(Handle),
-         put({Ref, fhc_handle}, Handle1)
-     end ||
-        {{Ref, fhc_handle}, Handle} <- get(),
-        size(Handle#handle.read_buffer) > 0
-    ].
-
 %%----------------------------------------------------------------------------
 %% Internal functions
 %%----------------------------------------------------------------------------
@@ -651,13 +567,9 @@ append_to_write(Mode) ->
 with_handles(Refs, Fun) ->
     with_handles(Refs, reset, Fun).
 
-with_handles(Refs, ReadBuffer, Fun) ->
+with_handles(Refs, _ReadBuffer, Fun) ->
     case get_or_reopen([{Ref, reopen} || Ref <- Refs]) of
-        {ok, Handles0} ->
-            Handles = case ReadBuffer of
-                          reset -> [reset_read_buffer(H) || H <- Handles0];
-                          keep  -> Handles0
-                      end,
+        {ok, Handles} ->
             case Fun(Handles) of
                 {Result, Handles1} when is_list(Handles1) ->
                     lists:zipwith(fun put_handle/2, Refs, Handles1),
@@ -733,10 +645,9 @@ reopen([{Ref, NewOrReopen, Handle = #handle { hdl          = closed,
         {ok, Hdl} ->
             Now = now(),
             {{ok, _Offset}, Handle1} =
-                maybe_seek(Offset, reset_read_buffer(
-                                     Handle#handle{hdl              = Hdl,
-                                                   offset           = 0,
-                                                   last_used_at     = Now})),
+                maybe_seek(Offset, Handle#handle{hdl          = Hdl,
+                                                 offset       = 0,
+                                                 last_used_at = Now}),
             put({Ref, fhc_handle}, Handle1),
             reopen(RefNewOrReopenHdls, gb_trees:insert(Now, Ref, Tree),
                    [{Ref, Handle1} | RefHdls]);
@@ -821,11 +732,6 @@ new_closed_handle(Path, Mode, Options) ->
             infinity             -> infinity;
             N when is_integer(N) -> N
         end,
-    ReadBufferSize =
-        case proplists:get_value(read_buffer, Options, unbuffered) of
-            unbuffered             -> 0;
-            N2 when is_integer(N2) -> N2
-        end,
     Ref = make_ref(),
     put({Ref, fhc_handle}, #handle { hdl                     = closed,
                                      offset                  = 0,
@@ -833,12 +739,6 @@ new_closed_handle(Path, Mode, Options) ->
                                      write_buffer_size       = 0,
                                      write_buffer_size_limit = WriteBufferSize,
                                      write_buffer            = [],
-                                     read_buffer             = <<>>,
-                                     read_buffer_pos         = 0,
-                                     read_buffer_rem         = 0,
-                                     read_buffer_size        = ReadBufferSize,
-                                     read_buffer_size_limit  = ReadBufferSize,
-                                     read_buffer_usage       = 0,
                                      at_eof                  = false,
                                      path                    = Path,
                                      mode                    = Mode,
@@ -901,24 +801,14 @@ hard_close(Handle) ->
 
 maybe_seek(New, Handle = #handle{hdl              = Hdl,
                                  offset           = Old,
-                                 read_buffer_pos  = BufPos,
-                                 read_buffer_rem  = BufRem,
                                  at_eof           = AtEoF}) ->
     {AtEoF1, NeedsSeek} = needs_seek(AtEoF, Old, New),
     case NeedsSeek of
-        true when is_number(New) andalso
-                  ((New >= Old andalso New =< BufRem + Old)
-                   orelse (New < Old andalso Old - New =< BufPos)) ->
-            Diff = New - Old,
-            {{ok, New}, Handle#handle{offset          = New,
-                                      at_eof          = AtEoF1,
-                                      read_buffer_pos = BufPos + Diff,
-                                      read_buffer_rem = BufRem - Diff}};
         true ->
             case prim_file_position(Hdl, New) of
                 {ok, Offset1} = Result ->
-                    {Result, reset_read_buffer(Handle#handle{offset = Offset1,
-                                                             at_eof = AtEoF1})};
+                    {Result, Handle#handle{offset = Offset1,
+                                           at_eof = AtEoF1}};
                 {error, _} = Error ->
                     {Error, Handle}
             end;
@@ -961,75 +851,6 @@ write_buffer(Handle = #handle { hdl = Hdl, offset = Offset,
                                   write_buffer = [], write_buffer_size = 0 }};
         {error, _} = Error ->
             {Error, Handle}
-    end.
-
-reset_read_buffer(Handle) ->
-    Handle#handle{read_buffer     = <<>>,
-                  read_buffer_pos = 0,
-                  read_buffer_rem = 0}.
-
-%% We come into this function whenever there's been a miss while
-%% reading from the buffer - but note that when we first start with a
-%% new handle the usage will be 0.  Therefore in that case don't take
-%% it as meaning the buffer was useless, we just haven't done anything
-%% yet!
-tune_read_buffer_limit(Handle = #handle{read_buffer_usage = 0}, _Count) ->
-    Handle;
-%% In this head we have been using the buffer but now tried to read
-%% outside it. So how did we do? If we used less than the size of the
-%% buffer, make the new buffer the size of what we used before, but
-%% add one byte (so that next time we can distinguish between getting
-%% the buffer size exactly right and actually wanting more). If we
-%% read 100% of what we had, then double it for next time, up to the
-%% limit that was set when we were created.
-tune_read_buffer_limit(Handle = #handle{read_buffer            = Buf,
-                                        read_buffer_usage      = Usg,
-                                        read_buffer_size       = Sz,
-                                        read_buffer_size_limit = Lim}, Count) ->
-    %% If the buffer is <<>> then we are in the first read after a
-    %% reset, the read_buffer_usage is the total usage from before the
-    %% reset. But otherwise we are in a read which read off the end of
-    %% the buffer, so really the size of this read should be included
-    %% in the usage.
-    TotalUsg = case Buf of
-                   <<>> -> Usg;
-                   _    -> Usg + Count
-               end,
-    Handle#handle{read_buffer_usage = 0,
-                  read_buffer_size  = erlang:min(case TotalUsg < Sz of
-                                                     true  -> Usg + 1;
-                                                     false -> Usg * 2
-                                                 end, Lim)}.
-
-maybe_reduce_read_cache(SparedRefs) ->
-    case rabbit_memory_monitor:memory_use(bytes) of
-        {_, infinity}                             -> ok;
-        {MemUse, MemLimit} when MemUse < MemLimit -> ok;
-        {MemUse, MemLimit}                        -> reduce_read_cache(
-                                                       (MemUse - MemLimit) * 2,
-                                                       SparedRefs)
-    end.
-
-reduce_read_cache(MemToFree, SparedRefs) ->
-    Handles = lists:sort(
-      fun({_, H1}, {_, H2}) -> H1 < H2 end,
-      [{R, H} || {{R, fhc_handle}, H} <- get(),
-                 not lists:member(R, SparedRefs)
-                 andalso size(H#handle.read_buffer) > 0]),
-    FreedMem = lists:foldl(
-      fun
-          (_, Freed) when Freed >= MemToFree ->
-              Freed;
-          ({Ref, #handle{read_buffer = Buf} = Handle}, Freed) ->
-              Handle1 = reset_read_buffer(Handle),
-              put({Ref, fhc_handle}, Handle1),
-              Freed + size(Buf)
-      end, 0, Handles),
-    if
-        FreedMem < MemToFree andalso SparedRefs =/= [] ->
-            reduce_read_cache(MemToFree - FreedMem, []);
-        true ->
-            ok
     end.
 
 infos(Items, State) -> [{Item, i(Item, State)} || Item <- Items].
@@ -1185,11 +1006,7 @@ handle_cast({transfer, N, FromPid, ToPid}, State) ->
     {noreply, process_pending(
                 update_counts({obtain, socket}, ToPid, +N,
                               update_counts({obtain, socket}, FromPid, -N,
-                                            State)))};
-
-handle_cast(clear_read_cache, State) ->
-    clear_process_read_cache(),
-    {noreply, State}.
+                                            State)))}.
 
 handle_info(check_counts, State) ->
     {noreply, maybe_reduce(State #fhc_state { timer_ref = undefined })};
