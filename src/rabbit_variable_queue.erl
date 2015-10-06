@@ -697,12 +697,14 @@ requeue(AckTags, #vqstate { delta      = Delta,
     {SeqIds1, Q3a, MsgIds1, State2} = queue_merge(SeqIds, Q3, MsgIds,
                                                   delta_limit(Delta),
                                                   fun publish_beta/2, State1),
-    {Delta1, MsgIds2, State3}       = delta_merge(SeqIds1, Delta, MsgIds1,
-                                                  State2),
+    State3 = ui(State2), %% flush QI pre_publish_cache to disk.
+    {Delta1, MsgIds2, State4}       = delta_merge(SeqIds1, Delta, MsgIds1,
+                                                  State3),
+    State5 = ui(State4), %% flush QI pre_publish_cache to disk.
     MsgCount = length(MsgIds2),
     {MsgIds2, a(reduce_memory_use(
                   maybe_update_rates(
-                    State3 #vqstate { delta      = Delta1,
+                    State5 #vqstate { delta      = Delta1,
                                       q3         = Q3a,
                                       q4         = Q4a,
                                       in_counter = InCounter + MsgCount,
@@ -1819,7 +1821,7 @@ publish_alpha(MsgStatus, State) ->
     {MsgStatus, stats({1, -1}, {MsgStatus, MsgStatus}, State)}.
 
 publish_beta(MsgStatus, State) ->
-    {MsgStatus1, State1} = maybe_write_to_disk(true, false, MsgStatus, State),
+    {MsgStatus1, State1} = maybe_prepare_write_to_disk(true, false, MsgStatus, State),
     MsgStatus2 = m(trim_msg_status(MsgStatus1)),
     {MsgStatus2, stats({1, -1}, {MsgStatus, MsgStatus2}, State1)}.
 
@@ -1856,7 +1858,8 @@ delta_merge(SeqIds, Delta, MsgIds, State) ->
                         {#msg_status { msg_id = MsgId } = MsgStatus, State1} =
                             msg_from_pending_ack(SeqId, State0),
                         {_MsgStatus, State2} =
-                            maybe_write_to_disk(true, true, MsgStatus, State1),
+                            maybe_prepare_write_to_disk(true, true,
+                                                        MsgStatus, State1),
                         {expand_delta(SeqId, Delta0), [MsgId | MsgIds0],
                          stats({1, -1}, {MsgStatus, none}, State2)}
                 end, {Delta, MsgIds, State}, SeqIds).
