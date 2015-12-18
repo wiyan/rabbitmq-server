@@ -18,7 +18,7 @@
 
 -export([init/3, terminate/2, delete_and_terminate/2, delete_crashed/1,
          purge/1, purge_acks/1,
-         publish/6, publish_delivered/5,
+         publish/6, publish_delivered/6,
          batch_publish/4, batch_publish_delivered/4,
          discard/4, drain_confirmed/1,
          dropwhile/2, fetchwhile/4, fetch/2, drop/2, ack/2, requeue/2,
@@ -317,6 +317,7 @@
           msg,
           is_persistent,
           is_delivered,
+          count_delivered,
           msg_in_store,
           index_on_disk,
           persist_to,
@@ -565,9 +566,9 @@ purge(State = #vqstate { len = Len }) ->
 
 purge_acks(State) -> a(purge_pending_ack(false, State)).
 
-publish(Msg, MsgProps, IsDelivered, ChPid, Flow, State) ->
+publish(Msg, MsgProps, CountDelivered, ChPid, Flow, State) ->
     State1 =
-        publish1(Msg, MsgProps, IsDelivered, ChPid, Flow,
+        publish1(Msg, MsgProps, CountDelivered, ChPid, Flow,
                  fun maybe_write_to_disk/4,
                  State),
     a(reduce_memory_use(maybe_update_rates(State1))).
@@ -578,9 +579,9 @@ batch_publish(Publishes, ChPid, Flow, State) ->
     State2 = ui(State1),
     a(reduce_memory_use(maybe_update_rates(State2))).
 
-publish_delivered(Msg, MsgProps, ChPid, Flow, State) ->
+publish_delivered(Msg, MsgProps, Delivered, ChPid, Flow, State) ->
     {SeqId, State1} =
-        publish_delivered1(Msg, MsgProps, ChPid, Flow,
+        publish_delivered1(Msg, MsgProps, Delivered, ChPid, Flow,
                            fun maybe_write_to_disk/4,
                            State),
     {SeqId, a(reduce_memory_use(maybe_update_rates(State1)))}.
@@ -620,7 +621,7 @@ fetch(AckRequired, State) ->
             %% at this point, so read it in.
             {Msg, State2} = read_msg(MsgStatus, State1),
             {AckTag, State3} = remove(AckRequired, MsgStatus, State2),
-            {{Msg, MsgStatus#msg_status.is_delivered, AckTag}, a(State3)}
+            {{Msg, MsgStatus#msg_status.count_delivered, AckTag}, a(State3)}
     end.
 
 drop(AckRequired, State) ->
@@ -1117,38 +1118,40 @@ cons_if(false, _E, L) -> L.
 gb_sets_maybe_insert(false, _Val, Set) -> Set;
 gb_sets_maybe_insert(true,   Val, Set) -> gb_sets:add(Val, Set).
 
-msg_status(IsPersistent, IsDelivered, SeqId,
+msg_status(IsPersistent, CountDelivered, SeqId,
            Msg = #basic_message {id = MsgId}, MsgProps, IndexMaxSize) ->
     #msg_status{seq_id        = SeqId,
                 msg_id        = MsgId,
                 msg           = Msg,
                 is_persistent = IsPersistent,
-                is_delivered  = IsDelivered,
+                is_delivered  = CountDelivered > 0,
+                count_delivered = CountDelivered,
                 msg_in_store  = false,
                 index_on_disk = false,
                 persist_to    = determine_persist_to(Msg, MsgProps, IndexMaxSize),
                 msg_props     = MsgProps}.
 
 beta_msg_status({Msg = #basic_message{id = MsgId},
-                 SeqId, MsgProps, IsPersistent, IsDelivered}) ->
-    MS0 = beta_msg_status0(SeqId, MsgProps, IsPersistent, IsDelivered),
+                 SeqId, MsgProps, IsPersistent, CountDelivered}) ->
+    MS0 = beta_msg_status0(SeqId, MsgProps, IsPersistent, CountDelivered),
     MS0#msg_status{msg_id       = MsgId,
                    msg          = Msg,
                    persist_to   = queue_index,
                    msg_in_store = false};
 
-beta_msg_status({MsgId, SeqId, MsgProps, IsPersistent, IsDelivered}) ->
-    MS0 = beta_msg_status0(SeqId, MsgProps, IsPersistent, IsDelivered),
+beta_msg_status({MsgId, SeqId, MsgProps, IsPersistent, CountDelivered}) ->
+    MS0 = beta_msg_status0(SeqId, MsgProps, IsPersistent, CountDelivered),
     MS0#msg_status{msg_id       = MsgId,
                    msg          = undefined,
                    persist_to   = msg_store,
                    msg_in_store = true}.
 
-beta_msg_status0(SeqId, MsgProps, IsPersistent, IsDelivered) ->
+beta_msg_status0(SeqId, MsgProps, IsPersistent, CountDelivered) ->
   #msg_status{seq_id        = SeqId,
               msg           = undefined,
               is_persistent = IsPersistent,
-              is_delivered  = IsDelivered,
+              count_delivered = CountDelivered,
+              is_delivered  = CountDelivered > 0,
               index_on_disk = true,
               msg_props     = MsgProps}.
 
@@ -1221,11 +1224,11 @@ maybe_write_delivered(true, SeqId, IndexState) ->
 betas_from_index_entries(List, TransientThreshold, DelsAndAcksFun, State) ->
     {Filtered, Delivers, Acks, RamReadyCount, RamBytes} =
         lists:foldr(
-          fun ({_MsgOrId, SeqId, _MsgProps, IsPersistent, IsDelivered} = M,
+          fun ({_MsgOrId, SeqId, _MsgProps, IsPersistent, CountDelivered} = M,
                {Filtered1, Delivers1, Acks1, RRC, RB} = Acc) ->
                   case SeqId < TransientThreshold andalso not IsPersistent of
                       true  -> {Filtered1,
-                                cons_if(not IsDelivered, SeqId, Delivers1),
+                                cons_if(CountDelivered == 0, SeqId, Delivers1),
                                 [SeqId | Acks1], RRC, RB};
                       false -> MsgStatus = m(beta_msg_status(M)),
                                HaveMsg = msg_in_ram(MsgStatus),
@@ -1702,7 +1705,7 @@ process_delivers_and_acks_fun(_) ->
 
 publish1(Msg = #basic_message { is_persistent = IsPersistent, id = MsgId },
          MsgProps = #message_properties { needs_confirming = NeedsConfirming },
-         IsDelivered, _ChPid, _Flow, PersistFun,
+         CountDelivered, _ChPid, _Flow, PersistFun,
          State = #vqstate { q1 = Q1, q3 = Q3, q4 = Q4,
                             mode                = default,
                             qi_embed_msgs_below = IndexMaxSize,
@@ -1711,7 +1714,7 @@ publish1(Msg = #basic_message { is_persistent = IsPersistent, id = MsgId },
                             durable             = IsDurable,
                             unconfirmed         = UC }) ->
     IsPersistent1 = IsDurable andalso IsPersistent,
-    MsgStatus = msg_status(IsPersistent1, IsDelivered, SeqId, Msg, MsgProps, IndexMaxSize),
+    MsgStatus = msg_status(IsPersistent1, CountDelivered, SeqId, Msg, MsgProps, IndexMaxSize),
     {MsgStatus1, State1} = PersistFun(false, false, MsgStatus, State),
     State2 = case ?QUEUE:is_empty(Q3) of
                  false -> State1 #vqstate { q1 = ?QUEUE:in(m(MsgStatus1), Q1) };
@@ -1725,7 +1728,7 @@ publish1(Msg = #basic_message { is_persistent = IsPersistent, id = MsgId },
                           unconfirmed = UC1 });
 publish1(Msg = #basic_message { is_persistent = IsPersistent, id = MsgId },
              MsgProps = #message_properties { needs_confirming = NeedsConfirming },
-             IsDelivered, _ChPid, _Flow, PersistFun,
+             CountDelivered, _ChPid, _Flow, PersistFun,
              State = #vqstate { mode                = lazy,
                                 qi_embed_msgs_below = IndexMaxSize,
                                 next_seq_id         = SeqId,
@@ -1734,7 +1737,7 @@ publish1(Msg = #basic_message { is_persistent = IsPersistent, id = MsgId },
                                 unconfirmed         = UC,
                                 delta               = Delta }) ->
     IsPersistent1 = IsDurable andalso IsPersistent,
-    MsgStatus = msg_status(IsPersistent1, IsDelivered, SeqId, Msg, MsgProps, IndexMaxSize),
+    MsgStatus = msg_status(IsPersistent1, CountDelivered, SeqId, Msg, MsgProps, IndexMaxSize),
     {MsgStatus1, State1} = PersistFun(true, true, MsgStatus, State),
     Delta1 = expand_delta(SeqId, Delta),
     UC1 = gb_sets_maybe_insert(NeedsConfirming, MsgId, UC),
@@ -1744,15 +1747,15 @@ publish1(Msg = #basic_message { is_persistent = IsPersistent, id = MsgId },
                           in_counter  = InCount + 1,
                           unconfirmed = UC1 }).
 
-batch_publish1({Msg, MsgProps, IsDelivered}, {ChPid, Flow, State}) ->
-    {ChPid, Flow, publish1(Msg, MsgProps, IsDelivered, ChPid, Flow,
+batch_publish1({Msg, MsgProps, CountDelivered}, {ChPid, Flow, State}) ->
+    {ChPid, Flow, publish1(Msg, MsgProps, CountDelivered, ChPid, Flow,
                            fun maybe_prepare_write_to_disk/4, State)}.
 
 publish_delivered1(Msg = #basic_message { is_persistent = IsPersistent,
                                           id = MsgId },
                    MsgProps = #message_properties {
                                  needs_confirming = NeedsConfirming },
-                   _ChPid, _Flow, PersistFun,
+                   Delivered, _ChPid, _Flow, PersistFun,
                    State = #vqstate { mode                = default,
                                       qi_embed_msgs_below = IndexMaxSize,
                                       next_seq_id         = SeqId,
@@ -1761,7 +1764,7 @@ publish_delivered1(Msg = #basic_message { is_persistent = IsPersistent,
                                       durable             = IsDurable,
                                       unconfirmed         = UC }) ->
     IsPersistent1 = IsDurable andalso IsPersistent,
-    MsgStatus = msg_status(IsPersistent1, true, SeqId, Msg, MsgProps, IndexMaxSize),
+    MsgStatus = msg_status(IsPersistent1, Delivered + 1, SeqId, Msg, MsgProps, IndexMaxSize),
     {MsgStatus1, State1} = PersistFun(false, false, MsgStatus, State),
     State2 = record_pending_ack(m(MsgStatus1), State1),
     UC1 = gb_sets_maybe_insert(NeedsConfirming, MsgId, UC),
@@ -1775,7 +1778,7 @@ publish_delivered1(Msg = #basic_message { is_persistent = IsPersistent,
                                           id = MsgId },
                    MsgProps = #message_properties {
                                  needs_confirming = NeedsConfirming },
-                   _ChPid, _Flow, PersistFun,
+                   Delivered, _ChPid, _Flow, PersistFun,
                    State = #vqstate { mode                = lazy,
                                       qi_embed_msgs_below = IndexMaxSize,
                                       next_seq_id         = SeqId,
@@ -1784,7 +1787,7 @@ publish_delivered1(Msg = #basic_message { is_persistent = IsPersistent,
                                       durable             = IsDurable,
                                       unconfirmed         = UC }) ->
     IsPersistent1 = IsDurable andalso IsPersistent,
-    MsgStatus = msg_status(IsPersistent1, true, SeqId, Msg, MsgProps, IndexMaxSize),
+    MsgStatus = msg_status(IsPersistent1, Delivered + 1, SeqId, Msg, MsgProps, IndexMaxSize),
     {MsgStatus1, State1} = PersistFun(true, true, MsgStatus, State),
     State2 = record_pending_ack(m(MsgStatus1), State1),
     UC1 = gb_sets_maybe_insert(NeedsConfirming, MsgId, UC),
@@ -1795,9 +1798,9 @@ publish_delivered1(Msg = #basic_message { is_persistent = IsPersistent,
                                      unconfirmed      = UC1 }),
     {SeqId, State3}.
 
-batch_publish_delivered1({Msg, MsgProps}, {ChPid, Flow, SeqIds, State}) ->
+batch_publish_delivered1({Msg, MsgProps, Delivered}, {ChPid, Flow, SeqIds, State}) ->
     {SeqId, State1} =
-        publish_delivered1(Msg, MsgProps, ChPid, Flow,
+        publish_delivered1(Msg, MsgProps, Delivered, ChPid, Flow,
                            fun maybe_prepare_write_to_disk/4,
                            State),
     {ChPid, Flow, [SeqId | SeqIds], State1}.

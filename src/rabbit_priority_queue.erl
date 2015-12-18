@@ -34,7 +34,7 @@
 
 -export([init/3, terminate/2, delete_and_terminate/2, delete_crashed/1,
          purge/1, purge_acks/1,
-         publish/6, publish_delivered/5, discard/4, drain_confirmed/1,
+         publish/6, publish_delivered/6, discard/4, drain_confirmed/1,
          batch_publish/4, batch_publish_delivered/4,
          dropwhile/2, fetchwhile/4, fetch/2, drop/2, ack/2, requeue/2,
          ackfold/4, fold/3, len/1, is_empty/1, depth/1,
@@ -217,15 +217,15 @@ batch_publish(Publishes, ChPid, Flow,
               State = #passthrough{bq = BQ, bqs = BQS}) ->
     ?passthrough1(batch_publish(Publishes, ChPid, Flow, BQS)).
 
-publish_delivered(Msg, MsgProps, ChPid, Flow, State = #state{bq = BQ}) ->
+publish_delivered(Msg, MsgProps, Delivered, ChPid, Flow, State = #state{bq = BQ}) ->
     pick2(fun (P, BQSN) ->
                   {AckTag, BQSN1} = BQ:publish_delivered(
-                                      Msg, MsgProps, ChPid, Flow, BQSN),
+                                      Msg, MsgProps, Delivered, ChPid, Flow, BQSN),
                   {{P, AckTag}, BQSN1}
           end, Msg, State);
-publish_delivered(Msg, MsgProps, ChPid, Flow,
+publish_delivered(Msg, MsgProps, Delivered, ChPid, Flow,
                   State = #passthrough{bq = BQ, bqs = BQS}) ->
-    ?passthrough2(publish_delivered(Msg, MsgProps, ChPid, Flow, BQS)).
+    ?passthrough2(publish_delivered(Msg, MsgProps, Delivered, ChPid, Flow, BQS)).
 
 batch_publish_delivered(Publishes, ChPid, Flow, State = #state{bq = BQ}) ->
     PubDict = partition_publish_delivered_batch(Publishes),

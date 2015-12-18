@@ -17,7 +17,7 @@
 -module(rabbit_mirror_queue_master).
 
 -export([init/3, terminate/2, delete_and_terminate/2,
-         purge/1, purge_acks/1, publish/6, publish_delivered/5,
+         purge/1, purge_acks/1, publish/6, publish_delivered/6,
          batch_publish/4, batch_publish_delivered/4,
          discard/4, fetch/2, drop/2, ack/2, requeue/2, ackfold/4, fold/3,
          len/1, is_empty/1, depth/1, drain_confirmed/1,
@@ -267,14 +267,15 @@ batch_publish(Publishes, ChPid, Flow,
 %% again at the slave, we do it here.
 
 publish_delivered(Msg = #basic_message { id = MsgId }, MsgProps,
-                  ChPid, Flow, State = #state { gm                  = GM,
+                  Delivered, ChPid, Flow, State = #state { gm                  = GM,
                                                 seen_status         = SS,
                                                 backing_queue       = BQ,
                                                 backing_queue_state = BQS }) ->
     false = dict:is_key(MsgId, SS), %% ASSERTION
-    ok = gm:broadcast(GM, {publish_delivered, ChPid, Flow, MsgProps, Msg},
+    % ????
+    ok = gm:broadcast(GM, {publish_delivered, ChPid, Flow, Delivered, MsgProps, Msg},
                       rabbit_basic:msg_size(Msg)),
-    {AckTag, BQS1} = BQ:publish_delivered(Msg, MsgProps, ChPid, Flow, BQS),
+    {AckTag, BQS1} = BQ:publish_delivered(Msg, MsgProps, Delivered, ChPid, Flow, BQS),
     State1 = State #state { backing_queue_state = BQS1 },
     {AckTag, ensure_monitoring(ChPid, State1)}.
 

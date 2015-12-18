@@ -545,7 +545,7 @@ attempt_delivery(Delivery = #delivery{sender  = SenderPid,
            fun (true)  -> true = BQ:is_empty(BQS),
                           {AckTag, BQS1} =
                               BQ:publish_delivered(
-                                Message, Props, SenderPid, Flow, BQS),
+                                Message, Props, Delivered, SenderPid, Flow, BQS),
                           {{Message, Delivered, AckTag}, {BQS1, MTC}};
                (false) -> {{Message, Delivered, undefined},
                            discard(Delivery, BQ, BQS, MTC)}
@@ -572,7 +572,8 @@ deliver_or_enqueue(Delivery = #delivery{message = Message,
     Props = message_properties(Message, Confirm, State1),
     {IsDuplicate, BQS1} = BQ:is_duplicate(Message, BQS),
     State2 = State1#q{backing_queue_state = BQS1},
-    case IsDuplicate orelse attempt_delivery(Delivery, Props, Delivered,
+    DeliveredCount = case Delivered of false -> 0; true -> 1 end,
+    case IsDuplicate orelse attempt_delivery(Delivery, Props, DeliveredCount,
                                              State2) of
         true ->
             State2;
@@ -585,7 +586,7 @@ deliver_or_enqueue(Delivery = #delivery{message = Message,
             {BQS3, MTC1} = discard(Delivery, BQ, BQS2, MTC),
             State3#q{backing_queue_state = BQS3, msg_id_to_channel = MTC1};
         {undelivered, State3 = #q{backing_queue_state = BQS2}} ->
-            BQS3 = BQ:publish(Message, Props, Delivered, SenderPid, Flow, BQS2),
+            BQS3 = BQ:publish(Message, Props, DeliveredCount, SenderPid, Flow, BQS2),
             {Dropped, State4 = #q{backing_queue_state = BQS4}} =
                 maybe_drop_head(State3#q{backing_queue_state = BQS3}),
             QLen = BQ:len(BQS4),

@@ -843,7 +843,7 @@ process_instruction({publish, ChPid, Flow, MsgProps,
     maybe_flow_ack(ChPid, Flow),
     State1 = #state { backing_queue = BQ, backing_queue_state = BQS } =
         publish_or_discard(published, ChPid, MsgId, State),
-    BQS1 = BQ:publish(Msg, MsgProps, true, ChPid, Flow, BQS),
+    BQS1 = BQ:publish(Msg, MsgProps, 1, ChPid, Flow, BQS),
     {ok, State1 #state { backing_queue_state = BQS1 }};
 process_instruction({batch_publish, ChPid, Flow, Publishes}, State) ->
     maybe_flow_ack(ChPid, Flow),
@@ -854,13 +854,13 @@ process_instruction({batch_publish, ChPid, Flow, Publishes}, State) ->
                     end, State, Publishes),
     BQS1 = BQ:batch_publish(Publishes, ChPid, Flow, BQS),
     {ok, State1 #state { backing_queue_state = BQS1 }};
-process_instruction({publish_delivered, ChPid, Flow, MsgProps,
+process_instruction({publish_delivered, ChPid, Flow, Delivered, MsgProps,
                      Msg = #basic_message { id = MsgId }}, State) ->
     maybe_flow_ack(ChPid, Flow),
     State1 = #state { backing_queue = BQ, backing_queue_state = BQS } =
         publish_or_discard(published, ChPid, MsgId, State),
     true = BQ:is_empty(BQS),
-    {AckTag, BQS1} = BQ:publish_delivered(Msg, MsgProps, ChPid, Flow, BQS),
+    {AckTag, BQS1} = BQ:publish_delivered(Msg, MsgProps, Delivered, ChPid, Flow, BQS),
     {ok, maybe_store_ack(true, MsgId, AckTag,
                          State1 #state { backing_queue_state = BQS1 })};
 process_instruction({batch_publish_delivered, ChPid, Flow, Publishes}, State) ->
