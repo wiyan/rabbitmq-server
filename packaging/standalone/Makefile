@@ -67,7 +67,7 @@ dist:
 	$(MAKE) generate_release
 
 	mkdir -p $(RLS_DIR)
-	tar -C $(RLS_DIR) -xzf $(RABBITMQ_HOME)/rabbit.tar.gz
+	tar -C $(RLS_DIR) -xzf $(RABBITMQ_HOME)/rabbit.tar.xz
 
 # add minimal boot file
 	cp $(ERTS_ROOT_DIR)/bin/start_clean.boot $(RLS_DIR)/releases/$(VERSION)
@@ -118,5 +118,5 @@ generate_release:
 	    -hidden \
 	    -s rabbit_release \
 	    -extra "$(RABBITMQ_PLUGINS_DIR)" "$(RABBITMQ_PLUGINS_EXPAND_DIR)" "$(RABBITMQ_HOME)"
-	test -f $(RABBITMQ_HOME)/rabbit.tar.gz
+	test -f $(RABBITMQ_HOME)/rabbit.tar.xz
 	rm src/rabbit_release.beam

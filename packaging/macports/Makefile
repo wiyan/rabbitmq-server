@@ -1,7 +1,7 @@
 TARBALL_SRC_DIR=../../dist
 TARBALL_BIN_DIR=../../packaging/generic-unix/
-TARBALL_SRC=$(wildcard $(TARBALL_SRC_DIR)/rabbitmq-server-[0-9.]*.tar.gz)
-TARBALL_BIN=$(wildcard $(TARBALL_BIN_DIR)/rabbitmq-server-generic-unix-[0-9.]*.tar.gz)
+TARBALL_SRC=$(wildcard $(TARBALL_SRC_DIR)/rabbitmq-server-[0-9.]*.tar.xz)
+TARBALL_BIN=$(wildcard $(TARBALL_BIN_DIR)/rabbitmq-server-generic-unix-[0-9.]*.tar.xz)
 COMMON_DIR=../common
 VERSION=$(shell echo $(TARBALL_SRC) | sed -e 's:rabbitmq-server-\(.*\)\.tar\.gz:\1:g')
 
