@@ -204,8 +204,14 @@ join_cluster(DiscoveryNode, NodeType) ->
                     {error, Reason}
             end;
         true ->
-            rabbit_log:info("Already member of cluster: ~p~n", [ClusterNodes]),
-            {ok, already_member}
+            %rabbit_log:info("Already member of cluster: ~p~n", [ClusterNodes]),
+            %{ok, already_member}
+            rabbit_log:info("Clustering with ~p as ~p node~n",
+                            [ClusterNodes, NodeType]),
+            ok = init_db_with_mnesia(ClusterNodes, NodeType,
+                                     true, true),
+            rabbit_node_monitor:notify_joined_cluster(),
+            ok
     end.
 
 %% return node to its virgin state, where it is not member of any
