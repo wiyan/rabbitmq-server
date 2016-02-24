@@ -40,6 +40,7 @@ register() ->
                           {policy_validator, <<"expires">>},
                           {policy_validator, <<"max-length">>},
                           {policy_validator, <<"max-length-bytes">>},
+                          {policy_validator, <<"max-length-strategy">>},
                           {policy_validator, <<"queue-mode">>}]],
     ok.
 
@@ -89,6 +90,13 @@ validate_policy0(<<"max-length-bytes">>, Value)
     ok;
 validate_policy0(<<"max-length-bytes">>, Value) ->
     {error, "~p is not a valid maximum length in bytes", [Value]};
+
+validate_policy0(<<"max-length-strategy">>, <<"dead-letter">>) ->
+    ok;
+validate_policy0(<<"max-length-strategy">>, <<"block">>) ->
+    ok;
+validate_policy0(<<"max-length-strategy">>, Value) ->
+    {error, "~p is not a valid max-length-strategy value", [Value]};
 
 validate_policy0(<<"queue-mode">>, <<"default">>) ->
     ok;

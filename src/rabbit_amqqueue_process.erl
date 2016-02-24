@@ -49,10 +49,12 @@
             ttl_timer_ref,
             ttl_timer_expiry,
             senders,
+            blocked_channels,
             dlx,
             dlx_routing_key,
             max_length,
             max_bytes,
+            max_length_strategy,
             args_policy_version,
             status
            }).
@@ -118,6 +120,7 @@ init_state(Q) ->
                has_had_consumers   = false,
                consumers           = rabbit_queue_consumers:new(),
                senders             = pmon:new(delegate),
+               blocked_channels    = pmon:new(delegate),
                msg_id_to_channel   = gb_trees:empty(),
                status              = running,
                args_policy_version = 0},
@@ -320,6 +323,7 @@ process_args_policy(State = #q{q                   = Q,
          {<<"message-ttl">>,             fun res_min/2, fun init_ttl/2},
          {<<"max-length">>,              fun res_min/2, fun init_max_length/2},
          {<<"max-length-bytes">>,        fun res_min/2, fun init_max_bytes/2},
+         {<<"max-length-strategy">>,     fun res_arg/2, fun init_max_length_strategy/2},
          {<<"queue-mode">>,              fun res_arg/2, fun init_queue_mode/2}],
       drop_expired_msgs(
          lists:foldl(fun({Name, Resolve, Fun}, StateN) ->
@@ -369,6 +373,10 @@ init_queue_mode(Mode, State = #q {backing_queue = BQ,
                                   backing_queue_state = BQS}) ->
     BQS1 = BQ:set_queue_mode(binary_to_existing_atom(Mode, utf8), BQS),
     State#q{backing_queue_state = BQS1}.
+
+init_max_length_strategy(undefined, State) -> State;
+init_max_length_strategy(Strat, State) -> 
+    State#q{max_length_strategy = binary_to_existing_atom(Strat, utf8)}.
 
 reply(Reply, NewState) ->
     {NewState1, Timeout} = next_state(NewState),
@@ -526,9 +534,10 @@ run_message_queue(ActiveConsumersChanged, State) ->
                         fun(AckRequired) -> fetch(AckRequired, State) end,
                         qname(State), State#q.consumers) of
                      {delivered, ActiveConsumersChanged1, State1, Consumers} ->
+                         State2 = maybe_unblock_senders(State1),
                          run_message_queue(
                            ActiveConsumersChanged or ActiveConsumersChanged1,
-                           State1#q{consumers = Consumers});
+                           State2#q{consumers = Consumers});
                      {undelivered, ActiveConsumersChanged1, Consumers} ->
                          maybe_notify_decorators(
                            ActiveConsumersChanged or ActiveConsumersChanged1,
@@ -564,8 +573,7 @@ attempt_delivery(Delivery = #delivery{sender  = SenderPid,
     end.
 
 deliver_or_enqueue(Delivery = #delivery{message = Message,
-                                        sender  = SenderPid,
-                                        flow    = Flow},
+                                        sender  = SenderPid},
                    Delivered, State = #q{backing_queue       = BQ,
                                          backing_queue_state = BQS}) ->
     send_mandatory(Delivery), %% must do this before confirms
@@ -585,23 +593,77 @@ deliver_or_enqueue(Delivery = #delivery{message = Message,
                                   msg_id_to_channel   = MTC}} ->
             {BQS3, MTC1} = discard(Delivery, BQ, BQS2, MTC),
             State3#q{backing_queue_state = BQS3, msg_id_to_channel = MTC1};
-        {undelivered, State3 = #q{backing_queue_state = BQS2}} ->
-            BQS3 = BQ:publish(Message, Props, Delivered, SenderPid, Flow, BQS2),
-            {Dropped, State4 = #q{backing_queue_state = BQS4}} =
-                maybe_drop_head(State3#q{backing_queue_state = BQS3}),
-            QLen = BQ:len(BQS4),
-            %% optimisation: it would be perfectly safe to always
-            %% invoke drop_expired_msgs here, but that is expensive so
-            %% we only do that if a new message that might have an
-            %% expiry ends up at the head of the queue. If the head
-            %% remains unchanged, or if the newly published message
-            %% has no expiry and becomes the head of the queue then
-            %% the call is unnecessary.
-            case {Dropped, QLen =:= 1, Props#message_properties.expiry} of
-                {false, false,         _} -> State4;
-                {true,  true,  undefined} -> State4;
-                {_,     _,             _} -> drop_expired_msgs(State4)
+        {undelivered, State3 = #q{backing_queue_state = BQS2, 
+                                  msg_id_to_channel   = MTC}} ->
+            case should_block(Delivery, State3) of
+                true ->
+                    State4 = block_sender(SenderPid, State3),
+                    {BQS3, MTC1} = discard(Delivery, BQ, BQS2, MTC),
+                    State4#q{backing_queue_state = BQS3, msg_id_to_channel = MTC1};
+                false ->
+                   do_publish(Delivery, Props, Delivered, State3) 
             end
+    end.
+
+should_block(#delivery{blocking = true}, 
+             State = #q{max_length_strategy = block}) -> 
+    over_max_length(State);
+should_block(_,_) -> false.
+
+block_sender(SenderPid, State = #q{q = #amqqueue{name = Name},
+                                   max_length = MaxLen,
+                                   blocked_channels = Blocked}) ->
+    BlockMsg = iolist_to_binary(io_lib:format(
+        "Queue ~s maximum length of ~p messges reached", 
+        [rabbit_misc:rs(Name), MaxLen])),
+    ok = gen_server2:cast(SenderPid, {block_sender, {self(), BlockMsg}}),
+    State#q{blocked_channels = pmon:monitor(SenderPid, Blocked)}.
+
+maybe_unblock_senders(State = #q{max_length_strategy = block,
+                                 blocked_channels = Blocked}) ->
+    case have_free_space(State) of
+        true ->
+            lists:foldl(
+                fun(SenderPid, StateFold) ->
+                    unblock_sender(SenderPid, StateFold)
+                end,
+                State,
+                pmon:monitored(Blocked));
+        false -> State
+    end;
+maybe_unblock_senders(State) -> State.
+
+have_free_space(#q{max_length = MaxLen, max_bytes = MaxBytes, 
+                   backing_queue = BQ, backing_queue_state = BQS}) ->
+    Depth = BQ:depth(BQS),
+    BytesReady = BQ:info(message_bytes_ready, BQS),
+    BytesUnacknowledged = BQ:info(message_bytes_unacknowledged, BQS),
+    MaxLen > Depth andalso MaxBytes > (BytesUnacknowledged + BytesReady).
+
+
+unblock_sender(SenderPid, State = #q{blocked_channels = Blocked}) ->
+    ok = gen_server2:cast(SenderPid, {unblock_sender, self()}),
+    State#q{blocked_channels = pmon:demonitor(SenderPid, Blocked)}.
+
+do_publish(Delivery, Props, Delivered, State) ->
+    #q{backing_queue = BQ, backing_queue_state = BQS} = State,
+    #delivery{message = Message, sender = SenderPid, flow = Flow} = Delivery,
+
+    BQS1 = BQ:publish(Message, Props, Delivered, SenderPid, Flow, BQS),
+    {Dropped, State1 = #q{backing_queue_state = BQS2}} =
+        maybe_drop_head(State#q{backing_queue_state = BQS1}),
+    QLen = BQ:len(BQS2),
+    %% optimisation: it would be perfectly safe to always
+    %% invoke drop_expired_msgs here, but that is expensive so
+    %% we only do that if a new message that might have an
+    %% expiry ends up at the head of the queue. If the head
+    %% remains unchanged, or if the newly published message
+    %% has no expiry and becomes the head of the queue then
+    %% the call is unnecessary.
+    case {Dropped, QLen =:= 1, Props#message_properties.expiry} of
+        {false, false,         _} -> State1;
+        {true,  true,  undefined} -> State1;
+        {_,     _,             _} -> drop_expired_msgs(State1)
     end.
 
 maybe_drop_head(State = #q{max_length = undefined,
@@ -670,7 +732,8 @@ should_auto_delete(State) -> is_unused(State).
 
 handle_ch_down(DownPid, State = #q{consumers          = Consumers,
                                    exclusive_consumer = Holder,
-                                   senders            = Senders}) ->
+                                   senders            = Senders,
+                                   blocked_channels   = Blocked}) ->
     State1 = State#q{senders = case pmon:is_monitored(DownPid, Senders) of
                                    false ->
                                        Senders;
@@ -687,7 +750,8 @@ handle_ch_down(DownPid, State = #q{consumers          = Consumers,
     %% that for us.
                                        credit_flow:peer_down(DownPid),
                                        pmon:demonitor(DownPid, Senders)
-                               end},
+                               end,
+                     blocked_channels = pmon:demonitor(DownPid, Blocked)},
     case rabbit_queue_consumers:erase_ch(DownPid, Consumers) of
         not_found ->
             {ok, State1};
@@ -1023,8 +1087,9 @@ handle_call({basic_get, ChPid, NoAck, LimiterPid}, _From,
                                 ChPid, LimiterPid, AckTag);
                 false -> ok
             end,
+            State3 = maybe_unblock_senders(State2),
             Msg = {QName, self(), AckTag, IsDelivered, Message},
-            reply({ok, BQ:len(BQS), Msg}, State2)
+            reply({ok, BQ:len(BQS), Msg}, State3)
     end;
 
 handle_call({basic_consume, NoAck, ChPid, LimiterPid, LimiterActive,
