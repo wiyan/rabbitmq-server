@@ -607,8 +607,8 @@ deliver_or_enqueue(Delivery = #delivery{message = Message,
 
 should_block(#delivery{blocking = true}, 
              State = #q{max_length_strategy = block}) -> 
-    over_max_length(State);
-should_block(_,_) -> false.
+    have_no_space(State);
+should_block(_, _) -> false.
 
 block_sender(SenderPid, State = #q{q = #amqqueue{name = Name},
                                    max_length = MaxLen,
@@ -632,6 +632,13 @@ maybe_unblock_senders(State = #q{max_length_strategy = block,
         false -> State
     end;
 maybe_unblock_senders(State) -> State.
+
+have_no_space(#q{max_length = MaxLen, max_bytes = MaxBytes, 
+                 backing_queue = BQ, backing_queue_state = BQS}) ->
+    Length = BQ:len(BQS),
+    BytesReady = BQ:info(message_bytes_ready, BQS),
+    MaxLen =< (Length + 1) orelse
+    MaxBytes =< BytesReady. 
 
 have_free_space(#q{max_length = MaxLen, max_bytes = MaxBytes, 
                    backing_queue = BQ, backing_queue_state = BQS}) ->
