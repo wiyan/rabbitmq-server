@@ -4,6 +4,7 @@ inputs:
 - name: rabbit
 - name: rabbit_common
 - name: rabbitmq_codegen
+- name: amqp_client
 image_resource:
   type: docker-image
   source:
