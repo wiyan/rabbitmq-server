@@ -125,7 +125,7 @@ remove_backup() ->
 
 maybe_upgrade_mnesia() ->
     AllNodes = rabbit_mnesia:cluster_nodes(all),
-    ok = rabbit_mnesia_rename:maybe_finish(AllNodes),
+    ok = rabbit_mnesia_rename_finish:maybe_finish(AllNodes),
     case rabbit_version:upgrades_required(mnesia) of
         {error, starting_from_scratch} ->
             ok;
