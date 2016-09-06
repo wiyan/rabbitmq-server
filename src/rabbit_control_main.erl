@@ -576,6 +576,12 @@ action(set_vhost_limits, Node, [Defn], Opts, Inform) ->
     rpc_call(Node, rabbit_vhost_limit, parse_set, [VHostArg, Defn]),
     ok;
 
+action(set_user_limits, Node, [Defn], Opts, Inform) ->
+    VHostArg = list_to_binary(proplists:get_value(?VHOST_OPT, Opts)),
+    Inform("Setting user limits for user ~p", [VHostArg]),
+    rpc_call(Node, rabbit_user_limit, parse_set, [VHostArg, Defn]),
+    ok;
+
 action(clear_vhost_limits, Node, [], Opts, Inform) ->
     VHostArg = list_to_binary(proplists:get_value(?VHOST_OPT, Opts)),
     Inform("Clearing vhost ~p limits", [VHostArg]),
