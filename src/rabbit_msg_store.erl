@@ -32,6 +32,8 @@
          code_change/3, prioritise_call/4, prioritise_cast/3,
          prioritise_info/3, format_message_queue/2]).
 
+-export([wait_for_init/1]).
+
 %%----------------------------------------------------------------------------
 
 -include("rabbit_msg_store.hrl").
@@ -199,6 +201,7 @@
 -spec force_recovery(file:filename(), server()) -> 'ok'.
 -spec transform_dir(file:filename(), server(),
         fun ((any()) -> (rabbit_types:ok_or_error2(msg(), any())))) -> 'ok'.
+-spec wait_for_init(server()) -> 'ok'.
 
 %%----------------------------------------------------------------------------
 
@@ -482,6 +485,9 @@ start_global_store_link(Name, Dir, ClientRefs, StartupFunState) when is_atom(Nam
                            [Name, Dir, ClientRefs, StartupFunState],
                            [{timeout, infinity}]).
 
+wait_for_init(Server) ->
+    gen_server2:call(Server, wait_for_init, infinity).
+
 successfully_recovered_state(Server) ->
     gen_server2:call(Server, successfully_recovered_state, infinity).
 
@@ -712,6 +718,14 @@ clear_client(CRef, State = #msstate { cref_to_msg_ids = CTM,
 %%----------------------------------------------------------------------------
 
 init([Name, BaseDir, ClientRefs, StartupFunState]) ->
+    gen_server2:cast(self(),
+                     {init, {Name, BaseDir, ClientRefs, StartupFunState}}),
+    {ok, nostate,
+     hibernate,
+     {backoff, ?HIBERNATE_AFTER_MIN, ?HIBERNATE_AFTER_MIN, ?DESIRED_HIBERNATE}}.
+
+
+init_internal(Name, BaseDir, ClientRefs, StartupFunState) ->
     process_flag(trap_exit, true),
 
     ok = file_handle_cache:register_callback(?MODULE, set_maximum_since_use,
@@ -804,10 +818,7 @@ init([Name, BaseDir, ClientRefs, StartupFunState]) ->
                              [read | ?WRITE_MODE]),
     {ok, Offset} = file_handle_cache:position(CurHdl, Offset),
     ok = file_handle_cache:truncate(CurHdl),
-
-    {ok, maybe_compact(State1 #msstate { current_file_handle = CurHdl }),
-     hibernate,
-     {backoff, ?HIBERNATE_AFTER_MIN, ?HIBERNATE_AFTER_MIN, ?DESIRED_HIBERNATE}}.
+    noreply(maybe_compact(State1 #msstate { current_file_handle = CurHdl })).
 
 prioritise_call(Msg, _From, _Len, _State) ->
     case Msg of
@@ -819,6 +830,8 @@ prioritise_call(Msg, _From, _Len, _State) ->
 
 prioritise_cast(Msg, _Len, _State) ->
     case Msg of
+        %% init MUST have the highest priority
+        {init, _}                                          -> 100;
         {combine_files, _Source, _Destination, _Reclaimed} -> 8;
         {delete_file, _File, _Reclaimed}                   -> 8;
         {set_maximum_since_use, _Age}                      -> 8;
@@ -832,6 +845,8 @@ prioritise_info(Msg, _Len, _State) ->
         _                                                  -> 0
     end.
 
+handle_call(wait_for_init, _From, State) ->
+    reply(ok, State);
 handle_call(successfully_recovered_state, _From, State) ->
     reply(State #msstate.successfully_recovered, State);
 
@@ -861,6 +876,10 @@ handle_call({read, MsgId}, From, State) ->
 handle_call({contains, MsgId}, From, State) ->
     State1 = contains_message(MsgId, From, State),
     noreply(State1).
+
+%% Init should be run exactly once with nostate
+handle_cast({init, {Name, BaseDir, ClientRefs, StartupFunState}}, nostate) ->
+    init_internal(Name, BaseDir, ClientRefs, StartupFunState);
 
 handle_cast({client_dying, CRef},
             State = #msstate { dying_clients       = DyingClients,
@@ -1748,10 +1767,13 @@ build_index(Gatherer, Left, [],
     end;
 build_index(Gatherer, Left, [File|Files], State) ->
     ok = gatherer:fork(Gatherer),
-    ok = worker_pool:submit_async(
-           fun () -> build_index_worker(Gatherer, State,
+    spawn(fun () -> build_index_worker(Gatherer, State,
                                         Left, File, Files)
            end),
+    % ok = worker_pool:submit_async(
+    %        fun () -> build_index_worker(Gatherer, State,
+    %                                     Left, File, Files)
+    %        end),
     build_index(Gatherer, File, Files, State).
 
 build_index_worker(Gatherer, State = #msstate { dir = Dir },

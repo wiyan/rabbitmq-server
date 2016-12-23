@@ -510,10 +510,13 @@ start_msg_store(Refs, StartFunState) when is_map(Refs); Refs == undefined ->
                                 [?PERSISTENT_MSG_STORE_SUP, Refs, StartFunState]),
     %% Start message store for all known vhosts
     VHosts = rabbit_vhost:list(),
-    lists:foreach(fun(VHost) ->
-        add_vhost_msg_store(VHost)
-    end,
-    VHosts),
+    RestoreBatchSize = application:get_env(rabbit, msg_store_restore_batch_size,
+                                           erlang:system_info(schedulers)),
+    in_batches(RestoreBatchSize,
+               {rabbit_variable_queue, add_vhost_msg_store, []},
+               VHosts,
+               "Recovering batch ~p of ~p vhosts ~n",
+               "Batch ~p of ~p vhsots recovered ~n"),
     ok.
 
 add_vhost_msg_store(VHost) ->

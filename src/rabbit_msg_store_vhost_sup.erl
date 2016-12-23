@@ -22,7 +22,9 @@ init([Name, VhostsClientRefs, StartupFunState]) ->
 
 
 add_vhost(Name, VHost) ->
-    supervisor2:start_child(Name, [VHost]).
+    VHostPid = maybe_start_store_for_vhost(Name, VHost),
+    rabbit_msg_store:wait_for_init(VHostPid),
+    {ok, VHostPid}.
 
 start_store_for_vhost(Name, VhostsClientRefs, StartupFunState, VHost) ->
     case vhost_store_pid(Name, VHost) of
@@ -63,7 +65,7 @@ client_init(Name, Ref, MsgOnDiskFun, CloseFDsFun, VHost) ->
     rabbit_msg_store:client_init(VHostPid, Ref, MsgOnDiskFun, CloseFDsFun).
 
 maybe_start_store_for_vhost(Name, VHost) ->
-    case add_vhost(Name, VHost) of
+    case supervisor2:start_child(Name, [VHost]) of
         {ok, Pid}                       -> Pid;
         {error, {already_started, Pid}} -> Pid;
         Error                           -> throw(Error)
