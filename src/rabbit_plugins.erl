@@ -220,6 +220,7 @@ running_plugins() ->
 
 %%----------------------------------------------------------------------------
 
+-spec prepare_plugins(Enabled::[atom()]) -> Valid::[atom()].
 prepare_plugins(Enabled) ->
     {ok, PluginsDistDir} = application:get_env(rabbit, plugins_dir),
     {ok, ExpandDir} = application:get_env(rabbit, plugins_expand_dir),
@@ -228,17 +229,27 @@ prepare_plugins(Enabled) ->
     Wanted = dependencies(false, Enabled, AllPlugins),
     WantedPlugins = lookup_plugins(Wanted, AllPlugins),
     {ValidPlugins, Problems} = validate_plugins(WantedPlugins),
+    Unwanted = proplists:get_keys(Problems),
+    UnwantedDeps = dependencies(true, Unwanted, AllPlugins),
+
+    ToEnable = Wanted -- UnwantedDeps,
+
+    PluginsToEnable = lists:filter(fun(#plugin{name = Name}) ->
+                                       lists:member(Name, ToEnable)
+                                   end,
+                                   ValidPlugins),
+
     maybe_warn_about_invalid_plugins(Problems),
     case filelib:ensure_dir(ExpandDir ++ "/") of
         ok          -> ok;
         {error, E2} -> throw({error, {cannot_create_plugins_expand_dir,
                                       [ExpandDir, E2]}})
     end,
-    [prepare_plugin(Plugin, ExpandDir) || Plugin <- ValidPlugins],
+    [prepare_plugin(Plugin, ExpandDir) || Plugin <- PluginsToEnable],
 
     [prepare_dir_plugin(PluginAppDescPath) ||
         PluginAppDescPath <- filelib:wildcard(ExpandDir ++ "/*/ebin/*.app")],
-    Wanted.
+    ToEnable.
 
 maybe_warn_about_invalid_plugins([]) ->
     ok;
