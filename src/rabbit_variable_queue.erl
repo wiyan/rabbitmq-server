@@ -507,11 +507,16 @@ stop() ->
     ok = rabbit_queue_index:stop().
 
 start_msg_store(Refs, StartFunState) when is_map(Refs); Refs == undefined ->
+    MsgStoreModule = application:get_env(rabbit, msg_store_module, rabbit_msg_store),
+    rabbit_log:info("Using ~p to provide message store", [MsgStoreModule]),
     ok = rabbit_sup:start_child(?TRANSIENT_MSG_STORE_SUP, rabbit_msg_store_vhost_sup,
                                 [?TRANSIENT_MSG_STORE_SUP,
+                                 MsgStoreModule,
                                  undefined,  {fun (ok) -> finished end, ok}]),
     ok = rabbit_sup:start_child(?PERSISTENT_MSG_STORE_SUP, rabbit_msg_store_vhost_sup,
-                                [?PERSISTENT_MSG_STORE_SUP, Refs, StartFunState]),
+                                [?PERSISTENT_MSG_STORE_SUP,
+                                 MsgStoreModule,
+                                 Refs, StartFunState]),
     %% Start message store for all known vhosts
     VHosts = rabbit_vhost:list(),
     %% TODO: recovery is limited by queue index recovery
@@ -569,14 +574,17 @@ init(#amqqueue { name = QueueName, durable = IsDurable }, Terms,
     VHost = QueueName#resource.virtual_host,
     {PersistentClient, ContainsCheckFun} =
         case IsDurable of
-            true  -> C = msg_store_client_init(?PERSISTENT_MSG_STORE_SUP, PRef,
-                                               MsgOnDiskFun, AsyncCallback,
-                                               VHost),
-                     {C, fun (MsgId) when is_binary(MsgId) ->
-                                 rabbit_msg_store:contains(MsgId, C);
-                             (#basic_message{is_persistent = Persistent}) ->
-                                 Persistent
-                         end};
+            true  -> {M, C} = msg_store_client_init(?PERSISTENT_MSG_STORE_SUP,
+                                                    PRef,
+                                                    MsgOnDiskFun, AsyncCallback,
+                                                    VHost),
+                     {{M, C},
+                      fun
+                      (MsgId) when is_binary(MsgId) ->
+                          M:contains(MsgId, C);
+                      (#basic_message{is_persistent = Persistent}) ->
+                          Persistent
+                      end};
             false -> {undefined, fun(_MsgId) -> false end}
         end,
     TransientClient  = msg_store_client_init(?TRANSIENT_MSG_STORE_SUP,
@@ -607,10 +615,11 @@ terminate(_Reason, State) ->
         purge_pending_ack(true, State),
     PRef = case MSCStateP of
                undefined -> undefined;
-               _         -> ok = rabbit_msg_store:client_terminate(MSCStateP),
-                            rabbit_msg_store:client_ref(MSCStateP)
+               {MP, CP}  -> ok = MP:client_terminate(CP),
+                            MP:client_ref(CP)
            end,
-    ok = rabbit_msg_store:client_delete_and_terminate(MSCStateT),
+    {MT, CT} = MSCStateT,
+    ok = MT:client_delete_and_terminate(CT),
     Terms = [{persistent_ref,   PRef},
              {persistent_count, PCount},
              {persistent_bytes, PBytes}],
@@ -629,9 +638,10 @@ delete_and_terminate(_Reason, State) ->
         purge_pending_ack_delete_and_terminate(State1),
     case MSCStateP of
         undefined -> ok;
-        _         -> rabbit_msg_store:client_delete_and_terminate(MSCStateP)
+        {MP, CP}  -> MP:client_delete_and_terminate(CP)
     end,
-    rabbit_msg_store:client_delete_and_terminate(MSCStateT),
+    {MT, CT} = MSCStateT,
+    MT:client_delete_and_terminate(CT),
     a(State2 #vqstate { msg_store_clients = undefined }).
 
 delete_crashed(#amqqueue{name = QName}) ->
@@ -1280,28 +1290,28 @@ msg_store_client_init(MsgStore, Ref, MsgOnDiskFun, Callback, VHost) ->
 msg_store_write(MSCState, IsPersistent, MsgId, Msg) ->
     with_immutable_msg_store_state(
       MSCState, IsPersistent,
-      fun (MSCState1) ->
-              rabbit_msg_store:write_flow(MsgId, Msg, MSCState1)
+      fun ({Mod, MSCState1}) ->
+              Mod:write_flow(MsgId, Msg, MSCState1)
       end).
 
 msg_store_read(MSCState, IsPersistent, MsgId) ->
     with_msg_store_state(
       MSCState, IsPersistent,
-      fun (MSCState1) ->
-              rabbit_msg_store:read(MsgId, MSCState1)
+      fun ({Mod, MSCState1}) ->
+              Mod:read(MsgId, MSCState1)
       end).
 
 msg_store_remove(MSCState, IsPersistent, MsgIds) ->
     with_immutable_msg_store_state(
       MSCState, IsPersistent,
-      fun (MCSState1) ->
-              rabbit_msg_store:remove(MsgIds, MCSState1)
+      fun ({Mod, MSCState1}) ->
+              Mod:remove(MsgIds, MSCState1)
       end).
 
 msg_store_close_fds(MSCState, IsPersistent) ->
     with_msg_store_state(
       MSCState, IsPersistent,
-      fun (MSCState1) -> rabbit_msg_store:close_all_indicated(MSCState1) end).
+      fun ({Mod, MSCState1}) -> Mod:close_all_indicated(MSCState1) end).
 
 msg_store_close_fds_fun(IsPersistent) ->
     fun (?MODULE, State = #vqstate { msg_store_clients = MSCState }) ->
