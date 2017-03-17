@@ -1636,7 +1636,7 @@ count_msg_refs(Gen, Seed, State) ->
                                                       file = undefined,
                                                       ref_count = Delta },
                                       State);
-                     #msg_location { ref_count = RefCount } = StoreEntry ->
+                     #msg_location { ref_count = RefCount } ->
                          NewRefCount = RefCount + Delta,
                          case NewRefCount of
                              0 -> index_delete(MsgId, State);
@@ -1771,7 +1771,7 @@ build_index_worker(Gatherer, State = #msstate { dir = Dir },
         lists:foldl(
           fun (Obj = {MsgId, TotalSize, Offset}, {VMAcc, VTSAcc}) ->
                   case index_lookup(MsgId, State) of
-                      #msg_location { file = undefined } = StoreEntry ->
+                      #msg_location { file = undefined } ->
                           ok = index_update_file_location(MsgId,
                                                           File,
                                                           Offset,
