@@ -21,8 +21,11 @@
 -behaviour(rabbit_msg_store_index).
 
 -export([new/1, recover/1,
-         lookup/2, insert/2, update/2, update_fields/3, delete/2,
-         delete_object/2, clean_up_temporary_reference_count_entries_without_file/1, terminate/1]).
+         lookup/2, insert/2,
+         update_ref_count/3, update_file_location/5,
+         delete/2, delete_object/2,
+         clean_up_temporary_reference_count_entries_without_file/1,
+         terminate/1]).
 
 -define(MSG_LOC_NAME, rabbit_msg_store_ets_index).
 -define(FILENAME, "msg_store_index.ets").
@@ -52,12 +55,16 @@ insert(Obj, State) ->
     true = ets:insert_new(State #state.table, Obj),
     ok.
 
-update(Obj, State) ->
-    true = ets:insert(State #state.table, Obj),
+update_ref_count(Key, RefCount, State) ->
+    true = ets:update_element(State#state.table, Key,
+                              {#msg_location.ref_count, RefCount}),
     ok.
 
-update_fields(Key, Updates, State) ->
-    true = ets:update_element(State #state.table, Key, Updates),
+update_file_location(Key, File, Offset, TotalSize, State) ->
+    true = ets:update_element(State#state.table, Key,
+                              [{#msg_location.file, File},
+                               {#msg_location.offset, Offset},
+                               {#msg_location.total_size, TotalSize}]),
     ok.
 
 delete(Key, State) ->

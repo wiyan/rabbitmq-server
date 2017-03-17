@@ -1514,8 +1514,19 @@ index_lookup_positive_ref_count(Key, State) ->
         #msg_location {} = MsgLocation  -> MsgLocation
     end.
 
-index_update_ref_count(Key, RefCount, State) ->
-    index_update_fields(Key, {#msg_location.ref_count, RefCount}, State).
+index_update_ref_count(Key, RefCount,
+                       #msstate { index_module = Index,
+                                  index_state = State }) ->
+    Index:update_ref_count(Key, RefCount, State).
+
+index_update_file_location(Key, File, Offset, TotalSize,
+                           #gc_state{ index_module = Index,
+                                      index_state = State }) ->
+    Index:update_file_location(Key, File, Offset, TotalSize, State);
+index_update_file_location(Key, File, Offset, TotalSize,
+                           #msstate{ index_module = Index,
+                                     index_state = State }) ->
+    Index:update_file_location(Key, File, Offset, TotalSize, State).
 
 index_lookup(Key, #gc_state { index_module = Index,
                               index_state  = State }) ->
@@ -1530,16 +1541,6 @@ index_lookup(Key, #msstate { index_module = Index, index_state = State }) ->
 
 index_insert(Obj, #msstate { index_module = Index, index_state = State }) ->
     Index:insert(Obj, State).
-
-index_update(Obj, #msstate { index_module = Index, index_state = State }) ->
-    Index:update(Obj, State).
-
-index_update_fields(Key, Updates, #msstate{ index_module = Index,
-                                            index_state  = State }) ->
-    Index:update_fields(Key, Updates, State);
-index_update_fields(Key, Updates, #gc_state{ index_module = Index,
-                                             index_state  = State }) ->
-    Index:update_fields(Key, Updates, State).
 
 index_delete(Key, #msstate { index_module = Index, index_state = State }) ->
     Index:delete(Key, State).
@@ -1639,9 +1640,7 @@ count_msg_refs(Gen, Seed, State) ->
                          NewRefCount = RefCount + Delta,
                          case NewRefCount of
                              0 -> index_delete(MsgId, State);
-                             _ -> index_update(StoreEntry #msg_location {
-                                                 ref_count = NewRefCount },
-                                               State)
+                             _ -> index_update_ref_count(MsgId, NewRefCount, State)
                          end
                  end,
             count_msg_refs(Gen, Next, State)
@@ -1773,10 +1772,11 @@ build_index_worker(Gatherer, State = #msstate { dir = Dir },
           fun (Obj = {MsgId, TotalSize, Offset}, {VMAcc, VTSAcc}) ->
                   case index_lookup(MsgId, State) of
                       #msg_location { file = undefined } = StoreEntry ->
-                          ok = index_update(StoreEntry #msg_location {
-                                              file = File, offset = Offset,
-                                              total_size = TotalSize },
-                                            State),
+                          ok = index_update_file_location(MsgId,
+                                                          File,
+                                                          Offset,
+                                                          TotalSize,
+                                                          State),
                           {[Obj | VMAcc], VTSAcc + TotalSize};
                       _ ->
                           {VMAcc, VTSAcc}
@@ -2085,10 +2085,11 @@ copy_messages(WorkList, InitOffset, FinalOffset, SourceHdl, DestinationHdl,
                   %% CurOffset is in the DestinationFile.
                   %% Offset, BlockStart and BlockEnd are in the SourceFile
                   %% update MsgLocation to reflect change of file and offset
-                  ok = index_update_fields(MsgId,
-                                           [{#msg_location.file, Destination},
-                                            {#msg_location.offset, CurOffset}],
-                                           State),
+                  ok = index_update_file_location(MsgId,
+                                                  Destination,
+                                                  CurOffset,
+                                                  TotalSize,
+                                                  State),
                   {CurOffset + TotalSize,
                    case BlockEnd of
                        undefined ->
